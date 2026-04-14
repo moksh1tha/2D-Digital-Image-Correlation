@@ -1,128 +1,139 @@
 """
-Main entry point for the 2D Digital Image Correlation project.
-Runs both synthetic validation and real data analysis.
+Optical Tracking of Gauge Length — Main Script.
+
+Tracks marker points on tensile specimens, computes gauge length and strain.
 
 Usage:
-    python main.py --validate       Run synthetic DIC validation
-    python main.py --track          Run marker tracking on real data
-    python main.py --all            Run everything
-    python main.py --quick          Quick test (small dataset, few frames)
+    python3 main.py                     # Run on all datasets
+    python3 main.py --dataset dbe0b     # Run on one dataset
+    python3 main.py --step 50           # Process every 50th frame
+    python3 main.py --max-frames 500    # Limit frames
 """
 
-import sys
 import os
 import argparse
 import numpy as np
+import matplotlib.pyplot as plt
+from tracker import (
+    track_markers, compute_gauge_and_strain, get_image_files
+)
 
-sys.path.insert(0, os.path.dirname(__file__))
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+DATASETS = {
+    "dbe0b": os.path.join(BASE, "Images", "dbe0b"),
+    "dbe0c": os.path.join(BASE, "Images", "dbe0c"),
+}
+
+# ROI covering the specimen gauge section with markers
+# Determined from visual inspection of first frames
+ROI = {
+    "dbe0b": (150, 60, 300, 500),
+    "dbe0c": (150, 60, 300, 500),
+}
+
+# Marker pairs that define vertical gauge length (tensile direction)
+# Markers sorted: 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right
+GAUGE_PAIRS = [(0, 2), (1, 3)]
 
 
-def run_quick_test():
-    """Quick smoke test of the full pipeline."""
-    print("=" * 60)
-    print("QUICK TEST: Verifying DIC pipeline")
-    print("=" * 60)
+def analyze(name, image_dir, frame_step=10, max_frames=None):
+    """Run tracking on one dataset and plot results."""
+    print(f"\n{'='*50}")
+    print(f"Dataset: {name}")
+    print(f"{'='*50}")
 
-    from src.synthetic import generate_speckle_image, apply_displacement, uniform_translation
-    from src.solver import DICSolver
-    from src.strain import compute_strain_field
+    n_files = len(get_image_files(image_dir))
+    print(f"Total images: {n_files}")
 
-    # Generate small test images
-    print("\n1. Generating 128x128 synthetic speckle images...")
-    ref = generate_speckle_image(128, 128, n_speckles=500, seed=42)
+    roi = ROI.get(name)
+    results = track_markers(image_dir, frame_step=frame_step,
+                            max_frames=max_frames, roi=roi)
 
-    u_true, v_true = 2.35, -1.67
-    u_func, v_func = uniform_translation(u_true, v_true)
-    deformed = apply_displacement(ref, u_func, v_func)
+    frames = np.array(results["frames"])
+    centroids = results["centroids"]
+    config = results["config"]
 
-    print(f"   Applied translation: u={u_true}, v={v_true}")
+    # Calibration factor
+    mm_px = config["mm_per_pixel_x"] if config else 1.0
+    unit = "mm" if config else "px"
 
-    # Run DIC
-    print("\n2. Running DIC analysis...")
-    solver = DICSolver(ref, subset_size=15, step=10, search_radius=8)
-    results = solver.analyze(deformed, roi=(20, 20, 108, 108), verbose=True)
+    # Print marker positions in first frame
+    print(f"\nMarker positions (frame 0):")
+    for j in range(4):
+        cx, cy = centroids[0, j]
+        print(f"  Marker {j}: ({cx:.1f}, {cy:.1f}) px")
 
-    # Check results
-    valid = ~np.isnan(results['u'])
-    if np.sum(valid) > 0:
-        u_mean = np.nanmean(results['u'])
-        v_mean = np.nanmean(results['v'])
-        u_err = abs(u_mean - u_true)
-        v_err = abs(v_mean - v_true)
+    # Compute gauge lengths and strains for each pair
+    print(f"\nGauge length results ({unit}):")
+    pair_data = {}
+    for a, b in GAUGE_PAIRS:
+        g_px, g_mm, strain = compute_gauge_and_strain(centroids, a, b, mm_px)
+        pair_data[(a, b)] = (g_px, g_mm, strain)
 
-        print(f"\n3. Results:")
-        print(f"   Measured: u={u_mean:.4f}, v={v_mean:.4f}")
-        print(f"   Error:    u_err={u_err:.4f} px, v_err={v_err:.4f} px")
-        print(f"   Mean ZNCC: {np.nanmean(results['zncc']):.4f}")
+        valid = ~np.isnan(strain)
+        if np.any(valid):
+            s_max = np.nanmax(strain) * 100
+            s_final = strain[valid][-1] * 100
+            d0 = g_mm[0]
+            print(f"  Pair {a}-{b}: L0={d0:.2f} {unit}, "
+                  f"max strain={s_max:.2f}%, final strain={s_final:.2f}%")
 
-        # Strain (should be ~0 for translation)
-        exx, eyy, exy = compute_strain_field(
-            results['grid_x'], results['grid_y'],
-            results['u'], results['v'], window_size=3
-        )
-        print(f"   Strain (should be ~0): exx={np.nanmean(exx):.6f}, "
-              f"eyy={np.nanmean(eyy):.6f}")
+    # --- Plot ---
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
 
-        if u_err < 0.1 and v_err < 0.1:
-            print("\n   PASS: Sub-pixel accuracy achieved.")
-        else:
-            print("\n   WARNING: Error exceeds 0.1 px threshold.")
-    else:
-        print("\n   FAIL: No valid points computed.")
+    # 1. Gauge length
+    for (a, b), (g_px, g_mm, strain) in pair_data.items():
+        axes[0].plot(frames, g_mm, label=f"Pair {a}-{b}")
+    axes[0].set_ylabel(f"Gauge Length ({unit})")
+    axes[0].set_title(f"{name} — Gauge Length vs Frame")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    # 2. Engineering strain
+    for (a, b), (g_px, g_mm, strain) in pair_data.items():
+        axes[1].plot(frames, strain * 100, label=f"Pair {a}-{b}")
+    axes[1].set_ylabel("Engineering Strain (%)")
+    axes[1].set_title("Engineering Strain vs Frame")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    # 3. Marker y-positions over time (shows separation)
+    for j in range(4):
+        axes[2].plot(frames, centroids[:, j, 1], label=f"Marker {j}")
+    axes[2].set_xlabel("Frame Index")
+    axes[2].set_ylabel("Y position (px)")
+    axes[2].set_title("Marker Y-Coordinates vs Frame")
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    out_path = os.path.join(BASE, f"{name}_results.png")
+    plt.savefig(out_path, dpi=150)
+    print(f"\nPlot saved: {out_path}")
+    plt.show()
 
     return results
 
 
-def run_validation():
-    """Run full synthetic validation suite."""
-    from run_validation import (
-        validate_translation, validate_strain,
-        validate_sinusoidal, validate_tensile
-    )
-    validate_translation()
-    validate_strain()
-    validate_sinusoidal()
-    validate_tensile()
-
-
-def run_tracking():
-    """Run marker tracking on real data."""
-    from run_tracker import analyze_dataset, IMAGE_DIRS, FRAME_STEP
-
-    for name, img_dir in IMAGE_DIRS.items():
-        if os.path.exists(img_dir):
-            analyze_dataset(name, img_dir, frame_step=FRAME_STEP, max_frames=2000)
-        else:
-            print(f"Directory not found: {img_dir}")
-
-
 def main():
-    parser = argparse.ArgumentParser(
-        description='2D Digital Image Correlation Engine'
-    )
-    parser.add_argument('--validate', action='store_true',
-                        help='Run synthetic DIC validation')
-    parser.add_argument('--track', action='store_true',
-                        help='Run marker tracking on real data')
-    parser.add_argument('--all', action='store_true',
-                        help='Run everything')
-    parser.add_argument('--quick', action='store_true',
-                        help='Quick pipeline test')
-
+    parser = argparse.ArgumentParser(description="Gauge Length Optical Tracker")
+    parser.add_argument("--dataset", type=str, default=None,
+                        help="Dataset name (dbe0b or dbe0c). Default: all.")
+    parser.add_argument("--step", type=int, default=10,
+                        help="Process every Nth frame. Default: 10.")
+    parser.add_argument("--max-frames", type=int, default=None,
+                        help="Max frames to process. Default: all.")
     args = parser.parse_args()
 
-    if not any([args.validate, args.track, args.all, args.quick]):
-        args.quick = True  # Default to quick test
+    targets = {args.dataset: DATASETS[args.dataset]} if args.dataset else DATASETS
 
-    if args.quick or args.all:
-        run_quick_test()
-
-    if args.validate or args.all:
-        run_validation()
-
-    if args.track or args.all:
-        run_tracking()
+    for name, path in targets.items():
+        if not os.path.isdir(path):
+            print(f"Not found: {path}")
+            continue
+        analyze(name, path, frame_step=args.step, max_frames=args.max_frames)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
